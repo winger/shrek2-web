@@ -1,0 +1,10 @@
+import { prepare, root, runtime, run, bun } from './prepare-runtime.mjs';
+import { cp, rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+await prepare();
+await rm(path.join(runtime, 'dist'), { recursive: true, force: true });
+run(bun, ['run', 'build'], { env: { ...process.env, PATH: `${path.dirname(bun)}${path.delimiter}${process.env.PATH}`, BASE_PATH: process.env.BASE_PATH || '/' } });
+await rm(path.join(root, 'dist'), { recursive: true, force: true });
+await cp(path.join(runtime, 'dist'), path.join(root, 'dist'), { recursive: true });
+await writeFile(path.join(root, 'dist/.nojekyll'), '');
+await import('./verify-package.mjs');

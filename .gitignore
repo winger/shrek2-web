@@ -1,0 +1,12 @@
+local/
+browser-runtime/
+.DS_Store
+__pycache__/
+dist/
+node_modules/
+*.iso
+*.wgb
+*.cab
+*.msi
+*.exe
+*.dll

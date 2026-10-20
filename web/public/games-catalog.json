@@ -1,0 +1,13 @@
+[
+  {
+    "id": "shrek2",
+    "name": "Shrek 2",
+    "subtitle": "Your local PC copy",
+    "wgbUrl": "./shrek2-pc-en-v1.wgb",
+    "description": "English 2004 Windows PC edition imported from your own ISO.",
+    "year": "2004",
+    "genre": "Adventure",
+    "coverUrl": "",
+    "enabled": true
+  }
+]

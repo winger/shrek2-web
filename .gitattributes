@@ -1,0 +1,3 @@
+# Unified-diff context markers and verbatim upstream license text are intentional.
+patches/*.patch -whitespace
+web/public/licenses/*.txt -whitespace

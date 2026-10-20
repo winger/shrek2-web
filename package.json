@@ -1,0 +1,13 @@
+{
+  "name": "shrek2-web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "prepare-runtime": "node scripts/prepare-runtime.mjs",
+    "build": "node scripts/build.mjs",
+    "test": "node scripts/test.mjs",
+    "preview": "node scripts/serve.mjs"
+  },
+  "engines": { "node": ">=22" }
+}

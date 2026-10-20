@@ -1,0 +1,382 @@
+--- a/src/worker/core/pe-import-binding.ts
++++ b/src/worker/core/pe-import-binding.ts
+@@ -101,10 +101,14 @@
+     // skips. A rule with no file on disk stays thunked: metadata must not be able to turn an
+     // import into an unbound one.
+     if (isThunked && deps.appDirRule(dllNameRaw) !== null) {
+-        const appDirPath = deps.findDllPath(dllName);
++        const appDirPath = deps.findDllPath(dllNameBeforeAlias);
+         if (appDirPath && !deps.isUnderSystemDirectory(appDirPath)) {
+             deps.log(`[PE] "${dllNameRaw}" -> the game's own ${appDirPath} (manifest.appDirDlls), not the HLE module`);
+             isThunked = false;
++            // An explicit app-directory rule selects the actual requested image.
++            // Keeping an HLE alias here would try loading a different filename.
++            dllName = dllNameBeforeAlias;
++            aliasTarget = null;
+         }
+     }
+ 
+--- a/src/worker/core/pe-loader.ts
++++ b/src/worker/core/pe-loader.ts
+@@ -649,7 +649,8 @@
+         const dllNameLower = dllName.toLowerCase().replace(/\.dll$/, '');
+ 
+         // Skip native load of video DLLs when HLE stubs are active
+-        if (!EMU_NATIVE_VIDEO_DLLS && VIDEO_DLL_NAMES.has(dllNameLower)) {
++        if (!EMU_NATIVE_VIDEO_DLLS && VIDEO_DLL_NAMES.has(dllNameLower)
++            && findDllRule(EmulatorConfig.getInstance().appDirDlls, dllNameLower) === null) {
+             Logger.log(LogCategory.SYSTEM, `[PE] Skipping native load of "${dllName}" — HLE stubs active`);
+             return { kind: "none" }; // IAT will be resolved to HLE thunk stubs
+         }
+--- a/tools/tests/pe-import-binding.test.ts
++++ b/tools/tests/pe-import-binding.test.ts
+@@ -93,4 +93,14 @@
+         }));
+         expect(b.isThunked).toBe(false);
+     });
++
++    it("an explicit app-directory rule resolves a versioned CRT before its HLE alias", () => {
++        const b = resolveImportBinding("MSVCR70.dll", [{ name: "swscanf" }], deps({
++            modules: ["msvcrt"], files: ["msvcr70"],
++            appDirRule: () => "msvcr70",
++        }));
++        expect(b.isThunked).toBe(false);
++        expect(b.dllName).toBe("msvcr70");
++        expect(b.aliasTarget).toBeNull();
++    });
+ });
+--- /dev/null
++++ b/tools/tests/native-video-selection.test.ts
+@@ -0,0 +1,29 @@
++import { afterEach, describe, expect, test } from 'bun:test';
++import { PELoader } from '../../src/worker/core/pe-loader';
++import { EmulatorConfig } from '../../src/worker/core/emulator-config-manager';
++
++const config = EmulatorConfig.getInstance();
++const original = config.appDirDlls;
++afterEach(() => { config.appDirDlls = original; });
++
++function loaderWithFile(path: string | null): PELoader {
++    return Object.assign(Object.create(PELoader.prototype), {
++        vfs: {}, moduleRegistry: { getByName: () => undefined },
++        loadingDlls: new Set(), findDllPath: () => path,
++    });
++}
++
++describe('explicit native video DLL selection', () => {
++    test('the default keeps video decoding on the HLE path', () => {
++        config.appDirDlls = [];
++        expect(loaderWithFile('C:\\Game\\binkw32.dll').peekLoadDll('binkw32')).toEqual({ kind: 'none' });
++    });
++    test('a manifest rule allows the actual game-shipped decoder to load', () => {
++        config.appDirDlls = ['binkw32'];
++        expect(loaderWithFile('C:\\Game\\binkw32.dll').peekLoadDll('binkw32')).toEqual({ kind: 'io' });
++    });
++    test('a rule without an existing decoder does not manufacture a DLL', () => {
++        config.appDirDlls = ['binkw32'];
++        expect(loaderWithFile(null).peekLoadDll('binkw32')).toEqual({ kind: 'none' });
++    });
++});
+--- /dev/null
++++ b/src/public-asset.ts
+@@ -0,0 +1,4 @@
++/** URL for a shipped runtime asset, including GitHub Pages project prefixes. */
++export function publicAsset(path: string): string {
++  return (import.meta.env?.BASE_URL ?? '/') + path.replace(/^\/+/, '');
++}
+--- a/src/deployment-config.ts
++++ b/src/deployment-config.ts
+@@ -1,3 +1,4 @@
++import { publicAsset } from './public-asset';
+ /**
+  * Per-DEPLOYMENT policy, fetched from deployment.json next to games-catalog.json.
+  *
+@@ -22,7 +23,7 @@
+ export async function loadDeploymentConfig(): Promise<DeploymentConfig> {
+     if (cached) return cached;
+     try {
+-        const resp = await fetch("/deployment.json");
++        const resp = await fetch(publicAsset('deployment.json'));
+         cached = resp.ok ? await resp.json() : {};
+     } catch {
+         cached = {};
+--- a/src/games-catalog.ts
++++ b/src/games-catalog.ts
+@@ -1,3 +1,4 @@
++import { publicAsset } from './public-asset';
+ /**
+  * Game library catalog — fetched from public/games-catalog.json instead of being
+  * baked into the JS bundle, so ops can add/hide a game (flip "enabled") by editing
+@@ -14,7 +15,7 @@
+ export async function loadGamesCatalog(): Promise<GameEntry[]> {
+     if (cached) return cached;
+     try {
+-        const resp = await fetch("/games-catalog.json");
++        const resp = await fetch(publicAsset('games-catalog.json'));
+         const entries: GamesCatalogFileEntry[] = resp.ok ? await resp.json() : [];
+         cached = entries.filter((g) => g.enabled !== false);
+     } catch {
+--- a/src/video/video-engine.ts
++++ b/src/video/video-engine.ts
+@@ -1,3 +1,4 @@
++import { publicAsset } from '../public-asset';
+ /**
+  * VideoEngine — video decoding behind one handle-based, sync/pull API, over two backends:
+  *
+@@ -277,7 +278,7 @@
+ 
+     private async _load(): Promise<void> {
+         try {
+-            const url = "/video-decoder.wasm";
++            const url = publicAsset('video-decoder.wasm');
+             Logger.log(LogCategory.SYSTEM, `[VideoEngine] Fetching ${url} …`);
+             const resp = await fetch(url);
+             if (!resp.ok) throw new Error(`fetch ${url} → ${resp.status}`);
+--- a/src/worker/emulator.worker.ts
++++ b/src/worker/emulator.worker.ts
+@@ -1,3 +1,4 @@
++import { publicAsset } from '../public-asset';
+ import { parseIoProfile, profileChunkOrder, type WgbIoPolicy } from "@bottleship/formats/wgb/io-profile";
+ import { V86 } from "v86";
+ import { ThunkGenerator } from "./core/thunking/thunk-generator";
+@@ -2340,7 +2341,7 @@
+   // across cold starts (it is keyed by URL and only fires for the *Streaming entry points —
+   // v86's own loader uses the buffer form and therefore always recompiles). Falls back to the
+   // buffered path by itself, so this can never be load-bearing for correctness.
+-  let wasmPath = import.meta.env?.DEV ? `/v86.wasm?t=${Date.now()}` : "/v86.wasm";
++  let wasmPath = import.meta.env?.DEV ? `${publicAsset('v86.wasm')}?t=${Date.now()}` : publicAsset('v86.wasm');
+   const labWasmPath = (globalThis as { __v86LabWasmPath?: string }).__v86LabWasmPath;
+   if (import.meta.env?.DEV && labWasmPath !== undefined) {
+     if (!/^\/apps\/source-pair-lab\/engines\/[a-f0-9]{64}\.wasm$/.test(labWasmPath)) {
+@@ -2355,7 +2356,7 @@
+   // as an explicit failure when they could not be captured.
+   const engineLoad: {
+     requested: string; path: string; sha256: string | null; bytes: number | null; error: string | null;
+-  } = { requested: labWasmPath ?? "/v86.wasm", path: wasmPath, sha256: null, bytes: null, error: null };
++  } = { requested: labWasmPath ?? publicAsset('v86.wasm'), path: wasmPath, sha256: null, bytes: null, error: null };
+   (globalThis as Record<string, unknown>).__v86EngineLoad = engineLoad;
+   void wasmLoader.sourceBytes.then(async (bytes) => {
+     if (!bytes) { engineLoad.error = "engine bytes not captured"; return; }
+@@ -2376,8 +2377,8 @@
+     wasm_path: wasmPath,
+     memory_size: ramSize,
+     vga_memory_size: EMU_VGA_MEMORY_SIZE,
+-    bios: { url: "/bios/seabios.bin" },
+-    vga_bios: { url: "/bios/vgabios.bin" },
++    bios: { url: publicAsset('bios/seabios.bin') },
++    vga_bios: { url: publicAsset('bios/vgabios.bin') },
+     autostart: false,
+     log_level: 0, // Disable v86 debug logging for performance
+   };
+@@ -3105,7 +3106,7 @@
+ 
+       // Dev-mode only: load debug-config.json if present and enabled
+       if (import.meta.env.DEV) {
+-        fetch('/debug-config.json')
++        fetch(publicAsset('debug-config.json'))
+           .then(r => r.ok ? r.json() : null)
+           .catch(() => null)
+           .then((cfg) => {
+--- a/src/worker/runtime/archive/unpack-buffered.ts
++++ b/src/worker/runtime/archive/unpack-buffered.ts
+@@ -1,3 +1,4 @@
++import { publicAsset } from '../../../public-asset';
+ /**
+  * TS loader for the `unpack-buffered` Rust→wasm crate (tools/build-unpack-buffered).
+  *
+@@ -33,8 +34,8 @@
+ export function init7z(): Promise<InitOutput> {
+     if (!initPromise) {
+         const url = import.meta.env?.DEV
+-            ? `/unpack-buffered.wasm?t=${Date.now()}`
+-            : "/unpack-buffered.wasm";
++            ? `${publicAsset('unpack-buffered.wasm')}?t=${Date.now()}`
++            : publicAsset('unpack-buffered.wasm');
+         initPromise = init({ module_or_path: fetch(url) });
+     }
+     return initPromise;
+--- a/src/worker/runtime/filesystem/installer-opfs.ts
++++ b/src/worker/runtime/filesystem/installer-opfs.ts
+@@ -1,3 +1,4 @@
++import { publicAsset } from '../../../public-asset';
+ /** GOG import workspace: one disk arena for extracted data, one streamed WGB output. */
+ import {
+     extractInno, parseInnoHeader, parseSliceSource, MultiSliceReader,
+@@ -83,7 +84,7 @@
+     const setup = source.blobs?.find((f) => /\.exe$/i.test(f.name)) ?? source.blob;
+     if (!setup) throw new Error("Drop the setup.exe together with every setup-*.bin part");
+     const input = blobRandomAccess(setup);
+-    const wasmResponse = await fetch("/unpack-streaming.wasm");
++    const wasmResponse = await fetch(publicAsset('unpack-streaming.wasm'));
+     if (!wasmResponse.ok) throw new Error(`Decoder download failed: HTTP ${wasmResponse.status}`);
+     const decoder = new UnpackDecoder();
+     await decoder.init(await wasmResponse.arrayBuffer());
+--- a/src/worker/runtime/filesystem/wgb-build.ts
++++ b/src/worker/runtime/filesystem/wgb-build.ts
+@@ -1,3 +1,4 @@
++import { publicAsset } from '../../../public-asset';
+ /** Classify, stage, inspect and finalize bundles without booting the guest. */
+ 
+ import {
+@@ -307,7 +308,7 @@
+ let _lzmaWasm: ArrayBuffer | null = null;
+ async function getLzmaWasm(): Promise<ArrayBuffer> {
+     if (_lzmaWasm) return _lzmaWasm;
+-    const resp = await fetch("/unpack-streaming.wasm");
++    const resp = await fetch(publicAsset('unpack-streaming.wasm'));
+     _lzmaWasm = await resp.arrayBuffer();
+     return _lzmaWasm;
+ }
+--- a/src/worker/backends/webgpu/shared/dxt-kernel.ts
++++ b/src/worker/backends/webgpu/shared/dxt-kernel.ts
+@@ -1,3 +1,4 @@
++import { publicAsset } from '../../../../public-asset';
+ /**
+  * WASM texture kernels: S3TC block decode and DirectDraw surface conversion.
+  *
+@@ -23,8 +24,8 @@
+ /** Below this the staging copies outweigh anything the kernel can win back. */
+ const MIN_PIXELS = 256;
+ 
+-export const DXT_KERNEL_URL = "/dxt-kernel.wasm";
+-export const DXT_KERNEL_SIMD_URL = "/dxt-kernel-simd.wasm";
++export const DXT_KERNEL_URL = publicAsset('dxt-kernel.wasm');
++export const DXT_KERNEL_SIMD_URL = publicAsset('dxt-kernel-simd.wasm');
+ 
+ export type KernelVariant = "scalar" | "simd" | "provided";
+ 
+--- a/src/worker/core/cpu/aot-cache.ts
++++ b/src/worker/core/cpu/aot-cache.ts
+@@ -1,3 +1,4 @@
++import { publicAsset } from '../../../public-asset';
+ /**
+  * AOT unit cache — stage 1 of the MS-A track.
+  *
+@@ -394,7 +395,7 @@
+         // codegen loadable into another, and the dangerous case is silent: if the imports still
+         // match and only codegen SEMANTICS changed (fastmem layout, relaxed FPU), nothing throws
+         // and wrong code gets published. Refusing to save/load is the safe failure.
+-        const r = await fetch("/v86.wasm");
++        const r = await fetch(publicAsset('v86.wasm'));
+         this.engineSha = hex(await crypto.subtle.digest("SHA-256", await r.arrayBuffer()));
+         return this.engineSha;
+     }
+--- a/src/settings/SettingsAboutSection.tsx
++++ b/src/settings/SettingsAboutSection.tsx
+@@ -7,7 +7,7 @@
+   return (
+     <SettingsSection>
+       <div className={s["about"]}>
+-        <img src="/bottleship_logo.png" className={s["about__bottle"]} alt="BottleShip" />
++        <img src={import.meta.env.BASE_URL + "bottleship_logo.png"} className={s["about__bottle"]} alt="BottleShip" />
+         <div className={s["about__title"]}>
+           Bottle<b>Ship</b>
+         </div>
+--- a/src/library/GameSelectScreen.tsx
++++ b/src/library/GameSelectScreen.tsx
+@@ -163,7 +163,7 @@
+       <header className={s["cmdbar"]}>
+         <div className={s["brand"]}>
+           <div className={s["brand__mark"]}>
+-            <img src="/bottleship_logo.png" className={s["brand__bottle"]} alt="BottleShip" />
++            <img src={import.meta.env.BASE_URL + "bottleship_logo.png"} className={s["brand__bottle"]} alt="BottleShip" />
+             <span className={s["wordmark"]}>
+               Bottle<b>Ship</b>
+             </span>
+@@ -209,7 +209,7 @@
+ 
+       {isFirstRun ? (
+         <section className={s["hero"]}>
+-          <img src="/bottleship_logo.png" className={s["hero__bottle"]} alt="BottleShip" />
++          <img src={import.meta.env.BASE_URL + "bottleship_logo.png"} className={s["hero__bottle"]} alt="BottleShip" />
+           <div className={s["hero__t"]}>Turn classic Windows games into browser-playable packages.</div>
+           <div className={s["hero__h"]}>
+             Drop a GOG installer, a folder, a ZIP, or a .wgb file. BottleShip runs it locally with
+--- a/src/app/App.tsx
++++ b/src/app/App.tsx
+@@ -3081,7 +3081,7 @@
+             No entry for “{gameIdFromUrl}” in games-catalog.json.
+           </p>
+           <button
+-            onClick={() => window.location.assign("/")}
++            onClick={() => window.location.assign(import.meta.env.BASE_URL)}
+             style={{
+               marginTop: "8px",
+               alignSelf: "flex-start",
+@@ -3150,7 +3150,7 @@
+               is a dead end. */}
+           {!policyBlock && (
+             <button
+-              onClick={() => window.location.assign("/")}
++              onClick={() => window.location.assign(import.meta.env.BASE_URL)}
+               style={{
+                 marginTop: "8px",
+                 alignSelf: "flex-start",
+@@ -3196,7 +3196,7 @@
+     >
+       {/* Top bar */}
+       <header className={s["emu-topbar"]}>
+-        <button className={cx(s, "emu-topbar-btn", "emu-back-btn")} onClick={() => window.location.assign("/")} title="Back to game selection">
++        <button className={cx(s, "emu-topbar-btn", "emu-back-btn")} onClick={() => window.location.assign(import.meta.env.BASE_URL)} title="Back to game selection">
+           ← Menu
+         </button>
+         <div className={s["emu-game-title"]}>
+--- a/src/app/ExitOverlay.tsx
++++ b/src/app/ExitOverlay.tsx
+@@ -53,7 +53,7 @@
+               <button className={cx(s, "app__exit-btn", "app__exit-btn--primary")} onClick={() => window.location.reload()}>
+                 Restart
+               </button>
+-              <button className={s["app__exit-btn"]} onClick={() => window.location.assign("/")}>
++              <button className={s["app__exit-btn"]} onClick={() => window.location.assign(import.meta.env.BASE_URL)}>
+                 Back to library
+               </button>
+             </div>
+@@ -73,7 +73,7 @@
+               <button className={cx(s, "app__exit-btn", "app__exit-btn--primary")} onClick={onDismissError}>
+                 Dismiss
+               </button>
+-              <button className={s["app__exit-btn"]} onClick={() => window.location.assign("/")}>
++              <button className={s["app__exit-btn"]} onClick={() => window.location.assign(import.meta.env.BASE_URL)}>
+                 Back to library
+               </button>
+             </div>
+--- a/vite.config.ts
++++ b/vite.config.ts
+@@ -201,7 +201,7 @@
+       if (!fs.existsSync(publicDir)) return;
+       fs.mkdirSync(outDir, { recursive: true });
+       for (const entry of fs.readdirSync(publicDir, { withFileTypes: true })) {
+-        if (entry.name === "apps") continue;
++        if (["apps", "covers", "reference", "webgpu-floor.html"].includes(entry.name)) continue;
+         fs.cpSync(path.join(publicDir, entry.name), path.join(outDir, entry.name), { recursive: true });
+       }
+     },
+@@ -209,6 +209,7 @@
+ }
+ 
+ export default defineConfig({
++  base: process.env.BASE_PATH || "/",
+   define: {
+     __BUILD_SHA__: JSON.stringify(BUILD_SHA),
+     __APP_VERSION__: JSON.stringify(APP_VERSION),
+--- a/bun.lock
++++ b/bun.lock
+@@ -1,5 +1,6 @@
+ {
+   "lockfileVersion": 1,
++  "configVersion": 0,
+   "workspaces": {
+     "": {
+       "name": "bottleship",
+--- a/src/app/WebGPUErrorOverlay.tsx
++++ b/src/app/WebGPUErrorOverlay.tsx
+@@ -134,7 +134,7 @@
+         <button className="wgpu-err__btn wgpu-err__btn--primary" onClick={() => window.location.reload()}>
+           Retry
+         </button>
+-        <button className="wgpu-err__btn wgpu-err__btn--ghost" onClick={() => window.location.assign("/")}>
++        <button className="wgpu-err__btn wgpu-err__btn--ghost" onClick={() => window.location.assign(import.meta.env.BASE_URL)}>
+           Back to library
+         </button>
+       </div>
