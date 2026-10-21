@@ -58,9 +58,10 @@ The scoped `isolation-sw.js` adds the COOP/COEP response policies required for S
 
 1. Honor explicit `appDirDlls` rules when choosing native video DLLs, so the original Bink decoder can provide its audio-track API.
 2. Resolve versioned CRT files under their actual requested name when an app-directory rule overrides an HLE alias.
-3. Use the deployment base for static runtime assets and navigation, and omit unrelated game covers/reference images from publication.
+3. Upload CPU-written D3D8 backbuffers before presentation, including native video frames that are not followed by a primitive draw. Authority checks preserve GPU-rendered frames.
+4. Use the deployment base for static runtime assets and navigation, and omit unrelated game covers/reference images from publication.
 
-The first two are generic loader corrections, covered by regression tests. The browser uses the original game-shipped DLLs from the user's ISO; no new substitute implementations or game patches are distributed.
+The loader and backbuffer corrections are generic runtime fixes, covered by regression tests. The browser uses the original game-shipped DLLs from the user's ISO; no new substitute implementations or game patches are distributed.
 
 ## Licenses
 
