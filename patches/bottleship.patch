@@ -604,3 +604,473 @@
 +        expect(t.ds.dbgAudioCalls.bytesUnlocked).toBe(SIZE);
 +    });
 +});
+--- a/src/worker/backends/webgpu/d3d9/ffp-lighting.ts
++++ b/src/worker/backends/webgpu/d3d9/ffp-lighting.ts
+@@ -672,7 +672,7 @@
+  * view space in both current callers, so the non-local-viewer direction is (0,0,-1) and the eye
+  * is the origin). Depends on ffpSelectColor (FFP_SELECT_COLOR_WGSL) and FfpLight being in scope.
+  */
+-export function emitFfpComputeLighting(lightsExpr: string): string {
++export function emitFfpComputeLighting(lightsExpr: string, lightArrayParameter = false): string {
+     return `
+ const FFP_FLOAT_MAX: f32 = 3.4028234e38;
+ 
+@@ -683,7 +683,8 @@
+     normalizeNormals: bool,
+     diffuseSrc: f32, ambientSrc: f32, specularSrc: f32, emissiveSrc: f32,
+     globalAmbient: vec3<f32>, numLights: i32,
+-    vDiffuse: vec4<f32>, vSpecular: vec4<f32>
++    vDiffuse: vec4<f32>, vSpecular: vec4<f32>${lightArrayParameter ? `,
++    lights: ptr<function, array<FfpLight, ${FFP_MAX_LIGHTS}>>` : ""}
+ ) -> array<vec4<f32>, 2> {
+     let matDif = ffpSelectColor(diffuseSrc, matDiffuse, vDiffuse, vSpecular);
+     let matAmb = ffpSelectColor(ambientSrc, matAmbient, vDiffuse, vSpecular);
+--- a/src/worker/backends/webgpu/d3d9/shader/emit/vs.ts
++++ b/src/worker/backends/webgpu/d3d9/shader/emit/vs.ts
+@@ -197,6 +197,8 @@
+     /** Replaces oPos + pixel-centre correction as the clip position (LinkOptions
+      *  fixedFunctionPosition); receives the constant-bank accessor in use. */
+     positionOverride?: (vsc: string) => string;
++    /** Synthesized FFP colour processing, after bytecode and before interpolation. */
++    lightingOverride?: (vsc: string) => string;
+     /** Hidden c[] slot carrying D3DRS_POINTSIZE, POINTSIZE_MIN and POINTSIZE_MAX. */
+     pointSizeSlot?: number;
+     /** Census to record this emit's opcode dispositions into. Passing one is how a caller
+@@ -553,6 +555,7 @@
+         body.line(`out.clipA = vec4<f32>(dot(_clipPlanePos, ${vsc}.c[${clipSlot}]), dot(_clipPlanePos, ${vsc}.c[${clipSlot + 1}]), dot(_clipPlanePos, ${vsc}.c[${clipSlot + 2}]), dot(_clipPlanePos, ${vsc}.c[${clipSlot + 3}]));`);
+         body.line(`out.clipB = vec2<f32>(dot(_clipPlanePos, ${vsc}.c[${clipSlot + 4}]), dot(_clipPlanePos, ${vsc}.c[${clipSlot + 5}]));`);
+     }
++    if (opts.lightingOverride) body.line(opts.lightingOverride(vsc));
+     const colorOutput = (name: string): string => prog.major < 3
+         ? `min(max(${name}, vec4<f32>(0.0)), vec4<f32>(1.0))`
+         : name;
+--- a/src/worker/backends/webgpu/d3d9/shader/link/index.ts
++++ b/src/worker/backends/webgpu/d3d9/shader/link/index.ts
+@@ -12,6 +12,8 @@
+  */
+ 
+ import { D3D_TRANSFORM_POSITION_WGSL } from "../../../shared/d3d-position";
++import { FFP_VERTEX_LIGHTING_REGISTERS, FFP_VERTEX_LIGHTING_WGSL, emitFixedFunctionVertexLighting,
++    type FixedFunctionVertexLighting } from "./ffp-vertex-lighting";
+ import { parseShader, SmProgram } from "../sm-parser";
+ import { analyzeVs, emitVsMain, VsAnalysis } from "../emit/vs";
+ import { analyzePs, emitPsMain, PsAnalysis, type PsInputBinding } from "../emit/ps";
+@@ -222,6 +224,8 @@
+      *  rows, pixel centre folded in) — so it is bit-identical to a fixed-function pass over
+      *  the same vertices. */
+     fixedFunctionPosition?: { inputRegister: number; matrixSlot: number } | null;
++    /** Lighting for a synthesized FFP vertex stage paired with a programmable PS. */
++    fixedFunctionLighting?: FixedFunctionVertexLighting | null;
+ }
+ 
+ /** WGSL locations for the pre-transformed passthrough vertex stage. Fixed, because there is
+@@ -622,7 +626,8 @@
+         }
+     }
+ 
+-    const vsConstantCount = vsA.constantCount;
++    const vsConstantCount = Math.max(vsA.constantCount, opts.fixedFunctionLighting
++        ? opts.fixedFunctionLighting.constantSlot + FFP_VERTEX_LIGHTING_REGISTERS : 0);
+     const psConstantCount = psA?.constantCount ?? 0;
+ 
+     // ── Assemble module ────────────────────────────────────────────────────
+@@ -690,12 +695,15 @@
+             + `(${position}).xyz)`;
+     }
+ 
++    if (opts.fixedFunctionLighting) emitter.line(FFP_VERTEX_LIGHTING_WGSL);
+     emitter.line(preTransformed
+         ? emitPreTransformedVsMain(interpColors, interpTexcoords, inputExprs,
+             preTransformed.viewportWidth, preTransformed.viewportHeight,
+             preTransformed.pixelCenterOffset ?? 0.5, needsProgrammableFog)
+         : emitVsMain(vs.prog, vsA, {
+             positionOverride: fixedFunctionPosition,
++            lightingOverride: opts.fixedFunctionLighting
++                ? vsc => emitFixedFunctionVertexLighting(opts.fixedFunctionLighting!, inputExprs, vsc) : undefined,
+             interpColors,
+             interpTexcoords,
+             interpFog: needsProgrammableFog,
+--- /dev/null
++++ b/src/worker/backends/webgpu/d3d9/shader/link/ffp-vertex-lighting.ts
+@@ -0,0 +1,80 @@
++/** Fixed-function lighting carried in a synthesized VS constant bank. Reuses the
++ * same light packing and WGSL lighting equation as the ordinary FFP backends. */
++import {
++    FFP_LIGHT_STRUCT_WGSL, FFP_SELECT_COLOR_WGSL, FFP_MAX_LIGHTS,
++    FFP_LIGHTSET_FLOATS, packFfpLightSet, emitFfpComputeLighting,
++    type FfpColor, type FfpLightInput,
++} from "../../ffp-lighting";
++import type { FFPLightingState } from "../../../../../modules/ddraw/d3d/ffp-lighting";
++
++// Seven vec4 material/control records, then the shared count + eight-light block.
++export const FFP_VERTEX_LIGHTING_REGISTERS = 7 + FFP_LIGHTSET_FLOATS / 4;
++export interface FixedFunctionVertexLighting {
++    constantSlot: number;
++    worldViewSlot: number;
++    normalMatrixSlot: number;
++    positionRegister: number;
++    normalRegister: number | null;
++}
++
++export const FFP_VERTEX_LIGHTING_WGSL = FFP_LIGHT_STRUCT_WGSL + FFP_SELECT_COLOR_WGSL
++    + emitFfpComputeLighting("(*lights)", true);
++
++/** Called after the synthesized bytecode has supplied oD0/oD1, before interpolation. */
++export function emitFixedFunctionVertexLighting(
++    o: FixedFunctionVertexLighting, inputs: Map<number, string>, vsc: string,
++): string {
++    const c = (n: number) => `${vsc}.c[${o.constantSlot + n}]`;
++    const pos = inputs.get(o.positionRegister) ?? "vec4f(0.0, 0.0, 0.0, 1.0)";
++    const normal = o.normalRegister === null ? "vec4f(0.0)" : inputs.get(o.normalRegister) ?? "vec4f(0.0)";
++    const transform = (v: string, slot: number) => `vec3f(${[0, 1, 2].map(i => `dot(${v}, ${vsc}.c[${slot + i}])`).join(", ")})`;
++    // A function-address-space array permits dynamic indexing on all supported WGSL
++    // validators, including those that reject indexing an array passed by value.
++    const lights = Array.from({ length: FFP_MAX_LIGHTS }, (_, i) =>
++        `_ffpLights[${i}] = FfpLight(${Array.from({ length: 7 }, (_, j) => c(8 + i * 7 + j)).join(", ")});`).join("\n");
++    return `
++var _ffpLights: array<FfpLight, ${FFP_MAX_LIGHTS}>;
++${lights}
++let _ffpLit = ffpComputeLighting(
++    ${transform(`vec4f((${pos}).xyz, 1.0)`, o.worldViewSlot)},
++    ${transform(`vec4f((${normal}).xyz, 0.0)`, o.normalMatrixSlot)},
++    ${c(0)}, ${c(1)}, ${c(2)}, ${c(3)},
++    ${c(5)}.x, ${c(5)}.y != 0.0, ${c(5)}.z != 0.0, ${o.normalRegister !== null},
++    ${c(5)}.w != 0.0,
++    ${c(6)}.x, ${c(6)}.y, ${c(6)}.z, ${c(6)}.w,
++    ${c(4)}.xyz, i32(${c(7)}.x), oD0, oD1, &_ffpLights);
++oD0 = _ffpLit[0];
++oD1 = vec4f(_ffpLit[1].xyz, oD1.w);
++`;
++}
++
++const IDENTITY = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
++/** Per-renderer scratch so packing an enabled light allocates no transient records. */
++export class FfpVertexLightingPacker {
++    private lights: FfpLightInput[] = [];
++    private pool: FfpLightInput[] = [];
++    write(out: Float32Array, slot: number, state: FFPLightingState, rs: ArrayLike<number>,
++        hasDiffuse: boolean, hasSpecular: boolean): void {
++        const base = slot * 4;
++        const color = (n: number, c: FfpColor) => out.set([c.r,c.g,c.b,c.a], base + n * 4);
++        color(0,state.material.diffuse); color(1,state.material.ambient);
++        color(2,state.material.specular); color(3,state.material.emissive); color(4,state.ambientColor);
++        out.set([state.material.power, +(rs[29] !== 0), +(rs[142] !== 0), +(rs[143] !== 0)], base + 20);
++        const source = (n: number) => rs[141] === 0 || (n === 1 && !hasDiffuse) || (n === 2 && !hasSpecular) ? 0 : n;
++        out.set([source(state.diffuseSource),source(state.ambientSource),source(state.specularSource),source(state.emissiveSource)],base+24);
++        this.lights.length = 0;
++        for (let i = 0; i < Math.min(state.lights.length, FFP_MAX_LIGHTS); i++) {
++            const l = state.lights[i]!;
++            const p = this.pool[i] ??= {
++                type:0,diffuse:l.diffuse,specular:l.specular,ambient:l.ambient,
++                position:[0,0,0],direction:[0,0,0],range:0,falloff:0,att0:0,att1:0,att2:0,theta:0,phi:0,
++            };
++            p.type=l.type;p.diffuse=l.diffuse;p.specular=l.specular;p.ambient=l.ambient;
++            p.position[0]=l.position.x;p.position[1]=l.position.y;p.position[2]=l.position.z;
++            p.direction[0]=l.direction.x;p.direction[1]=l.direction.y;p.direction[2]=l.direction.z;
++            p.range=l.range;p.falloff=l.falloff;p.att0=l.attenuation0;p.att1=l.attenuation1;p.att2=l.attenuation2;
++            p.theta=l.theta;p.phi=l.phi;this.lights.push(p);
++        }
++        packFfpLightSet(out.subarray(base+28), this.lights, state.viewMatrix ?? IDENTITY);
++    }
++}
+--- a/src/worker/backends/webgpu/d3d8/ffp-vertex-synth.ts
++++ b/src/worker/backends/webgpu/d3d8/ffp-vertex-synth.ts
+@@ -10,7 +10,7 @@
+  * bank that drives it. The program then links against the guest's pixel shader exactly
+  * like a guest-supplied vs_1_1.
+  *
+- * Lighting is outside this module's scope: a lit draw has no synthesized vertex stage.
++ * Lighting, when requested, is emitted by the linker using the shared FFP equation.
+  */
+ import { RegType, Op } from "../d3d9/shader/sm-enums";
+ import type { RawVertexElement } from "../d3d9/shader";
+@@ -69,6 +69,10 @@
+ export const FFP_SYNTH_POSITION = { inputRegister: VSDE_POSITION, matrixSlot: C_MVP } as const;
+ export const FFP_SYNTH_MAX_TEXCOORDS = 8;
+ export const FFP_SYNTH_CONSTANT_COUNT = C_TEXMATRIX + FFP_SYNTH_MAX_TEXCOORDS * 4;
++export const FFP_SYNTH_LIGHTING_SLOT = FFP_SYNTH_CONSTANT_COUNT;
++export const FFP_SYNTH_LIGHTING = { constantSlot: FFP_SYNTH_LIGHTING_SLOT,
++    worldViewSlot: C_WORLDVIEW, normalMatrixSlot: C_NORMAL,
++    positionRegister: VSDE_POSITION, normalRegister: VSDE_NORMAL } as const;
+ 
+ export interface FfpTexcoordSpec {
+     /** Output texcoord register n (= texture stage n). */
+@@ -83,6 +87,7 @@
+ }
+ 
+ export interface FfpVertexSpec {
++    lighting?: boolean;
+     hasDiffuse: boolean;
+     hasSpecular: boolean;
+     /** Component count of each texcoord set present in the declaration (index = set). */
+@@ -158,7 +163,7 @@
+         .map(t => `${t.output}.${t.mode}.${t.set}.${t.transformFlags}`)
+         .join(",");
+     const comps = spec.texcoordComponents.map(c => c ?? "-").join("");
+-    return `d${+spec.hasDiffuse}s${+spec.hasSpecular}n${+spec.hasNormal}${+spec.normalizeNormals}`
++    return `l${+!!spec.lighting}d${+spec.hasDiffuse}s${+spec.hasSpecular}n${+spec.hasNormal}${+spec.normalizeNormals}`
+         + `f${spec.fog}${+spec.rangeFog}c${comps}t${tc}`;
+ }
+ 
+--- a/src/worker/backends/webgpu/d3d8/d3d8-programmable-draw.ts
++++ b/src/worker/backends/webgpu/d3d8/d3d8-programmable-draw.ts
+@@ -58,6 +58,8 @@
+ import { resolveProgrammablePixelFogMode } from "../d3d9/ffp-fog";
+ import type { DrawViewport } from "../d3d9/d3d9-command-recorder";
+ import type { AlphaTest } from "../d3d9/shader/sm-wgsl";
++import { FfpVertexLightingPacker, FFP_VERTEX_LIGHTING_REGISTERS,
++    type FixedFunctionVertexLighting } from "../d3d9/shader/link/ffp-vertex-lighting";
+ import {
+     D3D_ALPHALESS_FORMATS,
+     FFP_MAX_STAGES,
+@@ -85,6 +87,8 @@
+     FFP_SYNTH_CONSTANT_COUNT,
+     FFP_SYNTH_MAX_TEXCOORDS,
+     FFP_SYNTH_POSITION,
++    FFP_SYNTH_LIGHTING,
++    FFP_SYNTH_LIGHTING_SLOT,
+     isFfpVertexSpecSupported,
+     synthesizeFfpVertexShader,
+     TTFF_PROJECTED,
+@@ -117,6 +121,7 @@
+ 
+ /** A synthesized fixed-function vertex stage and the link state it implies. */
+ export interface FfpVertexStage {
++    lighting: FixedFunctionVertexLighting | null;
+     compiled: CompiledVs;
+     /** buildD3D8FfpVariantKey for this stage's link (a pixel shader is always bound). */
+     variantKey: string;
+@@ -159,13 +164,15 @@
+     private readonly ffpHybridStagePool: FfpUniformParams["stages"][number][] = [];
+     /** Synthesized fixed-function vertex stages, by ffpVertexSpecKey. */
+     private readonly ffpVertexStages = new Map<string, FfpVertexStage>();
+-    private readonly ffpVertexConstants = new Float32Array(FFP_SYNTH_CONSTANT_COUNT * 4);
++    private readonly ffpVertexConstants = new Float32Array((FFP_SYNTH_CONSTANT_COUNT + FFP_VERTEX_LIGHTING_REGISTERS) * 4);
++    private readonly ffpVertexLighting = new FfpVertexLightingPacker();
+     // resolveFfpVertexStage memo: the inputs of the last resolution, compared field-wise so a
+     // draw whose state has not changed resolves without allocating.
+     private readonly ffpMemoState = new Int32Array(FFP_VERTEX_STATE_WORDS);
+     private ffpMemoVs = -1;
+     private ffpMemoPs = -1;
+     private ffpMemoResult: FfpVertexStage | null = null;
++    private readonly ffpVertexRefusals = new Set<string>();
+     private readonly viewportScratch: SanitizedViewport = { x: 0, y: 0, width: 0, height: 0, minZ: 0, maxZ: 1 };
+     private readonly drawViewportScratch: DrawViewport = { x: 0, y: 0, width: 0, height: 0, minZ: 0, maxZ: 1 };
+ 
+@@ -231,10 +238,11 @@
+         vsObj: D3D8VsObject,
+         ps: CompiledPs,
+     ): FfpVertexStage | null {
+-        if (this.getRS(adapter, D3DRENDERSTATE_LIGHTING) !== 0) return null;
+-        if (this.getRS(adapter, D3DRENDERSTATE_VERTEXBLEND) !== 0) return null;
++        if (this.getRS(adapter, D3DRENDERSTATE_VERTEXBLEND) !== 0) {
++            return this.unsupportedFfpVertex("vertex blending with a programmable pixel shader");
++        }
+         const inputs = describeDeclInputs(vsObj.decl);
+-        if (!inputs.hasPosition) return null;
++        if (!inputs.hasPosition) return this.unsupportedFfpVertex("declaration has no position input");
+ 
+         // D3DTTFF_PROJECTED is honoured by ps_1_1-1_3 `tex` alone; ps_1_4 and later project
+         // explicitly (texld _dw / texldp), so there the flag is not part of the coordinate.
+@@ -243,6 +251,7 @@
+         for (const n of ps.analysis.samplers) outputs.add(n);
+         const ts = adapter.textureStates;
+         const spec: FfpVertexSpec = {
++            lighting: this.getRS(adapter, D3DRENDERSTATE_LIGHTING) !== 0,
+             hasDiffuse: inputs.hasDiffuse,
+             hasSpecular: inputs.hasSpecular,
+             hasNormal: inputs.hasNormal,
+@@ -265,12 +274,14 @@
+             ),
+             rangeFog: this.getRS(adapter, D3DRENDERSTATE_RANGEFOGENABLE) !== 0,
+         };
+-        if (!isFfpVertexSpecSupported(spec)) return null;
++        if (!isFfpVertexSpecSupported(spec)) return this.unsupportedFfpVertex(
++            `texture-coordinate generation/transform unsupported: ${JSON.stringify(spec.texcoords)}`);
+         const key = ffpVertexSpecKey(spec);
+         let stage = this.ffpVertexStages.get(key);
+         if (!stage) {
+             const projectedMask = ffpProjectedMask(spec);
+             stage = {
++                lighting: spec.lighting ? { ...FFP_SYNTH_LIGHTING, normalRegister: inputs.hasNormal ? 3 : null } : null,
+                 compiled: compileVertexShader(synthesizeFfpVertexShader(spec)),
+                 variantKey: `${buildD3D8FfpVariantKey(0, projectedMask, null)}:fv${key}`,
+                 projectedMask,
+@@ -278,6 +289,14 @@
+             this.ffpVertexStages.set(key, stage);
+         }
+         return stage;
++    }
++
++    private unsupportedFfpVertex(reason: string): null {
++        if (!this.ffpVertexRefusals.has(reason)) {
++            this.ffpVertexRefusals.add(reason);
++            Logger.warn(LogCategory.SYSTEM, `D3D8 fixed-function vertex stage unsupported: ${reason}; fallback cannot execute the bound pixel shader`);
++        }
++        return null;
+     }
+ 
+     /**
+@@ -556,6 +575,7 @@
+                 samplerStates: hybridSamplers ?? undefined,
+                 projectedStages: projectedMask,
+                 fixedFunctionPosition: ffpVertex ? FFP_SYNTH_POSITION : null,
++                fixedFunctionLighting: ffpVertex?.lighting,
+             });
+             if (link.interpolantBudgetExceeded) {
+                 throw new Error("D3D8 shader link exceeds WebGPU inter-stage interpolant budget");
+@@ -639,7 +659,9 @@
+         const ps = psObj?.compiled ?? null;
+         // The linker places the hidden pixel-centre vec4 right after the program's own
+         // constant count, so a synthesized bank is cut to that count like a guest one.
+-        const vsConstantLen = Math.min(vs ? vs.analysis.constantCount : 0, 256) * 4;
++        const vsConstantLen = Math.min(ffpVertex?.lighting
++            ? Math.max(vs!.analysis.constantCount, FFP_SYNTH_LIGHTING_SLOT + FFP_VERTEX_LIGHTING_REGISTERS)
++            : vs ? vs.analysis.constantCount : 0, 256) * 4;
+         const vsLen = vsConstantLen + 4; // hidden c[] pixel-centre tail
+         // A bound VS with NO pixel shader still needs the fixed-function texture-stage
+         // cascade's state (see packFfpHybridPixelState / resolveProgrammablePipeline's
+@@ -665,6 +687,11 @@
+             const rt = adapter.activeRenderTarget;
+             const vp = sanitizeViewportInto(this.viewportScratch, adapter.viewport, rt.width, rt.height);
+             writeFfpVertexConstants(this.ffpVertexConstants, adapter, vp.width, vp.height);
++            if (ffpVertex.lighting) {
++                const inputs = describeDeclInputs(vsObj!.decl);
++                this.ffpVertexLighting.write(this.ffpVertexConstants, FFP_SYNTH_LIGHTING_SLOT,
++                    adapter.getFFPLightingState()!, adapter.renderStates, inputs.hasDiffuse, inputs.hasSpecular);
++            }
+             copyPrefix(state.vsConst, this.ffpVertexConstants, vsConstantLen);
+         } else {
+             state.vsConst.set(shaders.vsConstants.subarray(0, vsConstantLen));
+--- a/tools/tests/d3d8-ffp-vertex-synth.test.ts
++++ b/tools/tests/d3d8-ffp-vertex-synth.test.ts
+@@ -17,6 +17,7 @@
+     FFP_FOG_OUT_SPECULAR,
+     FFP_SYNTH_CONSTANT_COUNT,
+     FFP_SYNTH_POSITION,
++    FFP_SYNTH_LIGHTING,
+     synthesizeFfpVertexShader,
+     writeFfpVertexConstants,
+     type FfpVertexSpec,
+@@ -401,6 +402,7 @@
+         ffpMemoPs: -1,
+         ffpMemoResult: null,
+         ffpVertexStages: new Map(),
++        ffpVertexRefusals: new Set(),
+         resolveProgrammablePipeline: () => { calls.push("pipeline"); return 1; },
+         captureDrawState: () => 0,
+         drawViewport: () => ({ x: 0, y: 0, width: 640, height: 480, minZ: 0, maxZ: 1 }),
+@@ -469,9 +471,42 @@
+         expect(calls).toEqual(["pipeline", "programmable"]);
+     });
+ 
+-    test("a lit draw, which has no synthesized stage, keeps the fixed-function interleave", () => {
++    test("a lit draw preserves its programmable pixel shader instead of falling back", () => {
+         const { adapter, calls } = terrainAdapter(1);
+         expect(adapter.drawPrimitive(4, 0, 2)).toBe(0);
+-        expect(calls).toEqual(["ffp-interleave"]);
++        expect(calls).toEqual(["pipeline", "programmable"]);
++    });
++
++    test("lighting toggles invalidate the memo and produce distinct vertex-stage variants", () => {
++        const { adapter } = terrainAdapter(0);
++        const p = (adapter as any).programmable;
++        const a = p.resolveFfpVertexStage(adapter, (adapter as any).shaders);
++        adapter.renderStates[137] = 1;
++        const b = p.resolveFfpVertexStage(adapter, (adapter as any).shaders);
++        expect(a.variantKey).not.toBe(b.variantKey);
++        expect(a.lighting).toBeNull();
++        expect(b.lighting).toEqual(FFP_SYNTH_LIGHTING);
++    });
++
++    test("unsupported vertex blending is reported instead of silently losing the pixel shader", () => {
++        const { adapter } = terrainAdapter(1);
++        adapter.renderStates[151] = 1;
++        const p = (adapter as any).programmable;
++        expect(p.resolveFfpVertexStage(adapter, (adapter as any).shaders)).toBeNull();
++        expect([...p.ffpVertexRefusals]).toEqual(["vertex blending with a programmable pixel shader"]);
+     });
+ });
++
++test("lit terrain link reserves its lighting bank and uses the shared lighting equation", () => {
++    const vs = compileVertexShader(synthesizeFfpVertexShader(terrainSpec()));
++    const link = linkProgram({ vs, ps: compilePixelShader(terrainPs11()),
++        declElements:TERRAIN_DECL,streamStride:24,streamStrides:[24,4,8],
++        fixedFunctionPosition:FFP_SYNTH_POSITION,fixedFunctionLighting:FFP_SYNTH_LIGHTING });
++    expect(link.vsConstantCount).toBe(108);
++    expect(link.wgsl).toContain("ffpComputeLighting(");
++    expect(link.wgsl).toContain("oD0 = _ffpLit[0]");
++    expect(link.wgsl).toContain("(*lights)[i]");
++    expect(link.wgsl).toContain("vsc.c[107]");
++    const validator=probeOfflineWgslValidator();
++    if(validator.available){const r=validateWgslOffline(link.wgsl,validator);expect(r.status,r.diagnostics??r.reason).toBe("passed")}
++});
+--- /dev/null
++++ b/tools/tests/d3d8-ffp-lighting-bank.test.ts
+@@ -0,0 +1,66 @@
++import { describe, expect, test } from 'bun:test';
++import { FfpVertexLightingPacker, FFP_VERTEX_LIGHTING_REGISTERS } from '../../src/worker/backends/webgpu/d3d9/shader/link/ffp-vertex-lighting';
++import { createDefaultMaterial, type D3DLight7Data } from '../../src/worker/modules/ddraw/d3d/types';
++import type { FFPLightingState } from '../../src/worker/modules/ddraw/d3d/ffp-lighting';
++
++const I = new Float32Array([1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]);
++function fixture() {
++    const state: FFPLightingState = {
++        lightingEnabled:true, material:createDefaultMaterial(), lights:[],
++        ambientColor:{r:0.25,g:0.5,b:0.75,a:1}, worldMatrix:I,viewMatrix:I,
++        diffuseSource:2,ambientSource:2,specularSource:0,emissiveSource:1,
++    };
++    const rs = new Int32Array(256); rs[141]=1;rs[29]=1;rs[142]=1;rs[143]=1;
++    const out = new Float32Array(44*4+FFP_VERTEX_LIGHTING_REGISTERS*4+4).fill(-99);
++    const packer = new FfpVertexLightingPacker();
++    const write = (diffuse=true,specular=false) => packer.write(out,44,state,rs,diffuse,specular);
++    const at = (register:number) => Array.from(out.subarray((44+register)*4,(45+register)*4));
++    return {state,rs,out,write,at};
++}
++describe('synthesized D3D8 vertex-lighting transport',()=>{
++    test('material, control flags and missing-colour fallback match the lighting contract',()=>{
++        const t=fixture();
++        t.state.material.diffuse={r:1,g:0.5,b:0.25,a:0.125};
++        t.state.material.emissive={r:0.0625,g:0.125,b:0.25,a:0.5};
++        t.state.material.power=8;t.write();
++        expect(t.at(0)).toEqual([1,0.5,0.25,0.125]);
++        expect(t.at(3)).toEqual([0.0625,0.125,0.25,0.5]);
++        expect(t.at(4)).toEqual([0.25,0.5,0.75,1]);
++        expect(t.at(5)).toEqual([8,1,1,1]);
++        // COLOR2 is absent in terrain's declaration, so its material requests
++        // fall back to MATERIAL; emissive COLOR1 still uses the vertex diffuse.
++        expect(t.at(6)).toEqual([0,0,0,1]);
++        expect(t.at(7)).toEqual([0,0,0,0]);
++        expect(t.out[0]).toBe(-99);
++        expect(t.out[t.out.length-1]).toBe(-99);
++        t.rs[141]=0;t.write();
++        expect(t.at(6)).toEqual([0,0,0,0]);
++        t.rs[141]=1;t.write(true,true);
++        expect(t.at(6)).toEqual([2,2,0,1]);
++    });
++
++    test('directional, point and spot lights retain their type and transform into view space',()=>{
++        const t=fixture();
++        const light=(type:number):D3DLight7Data=>({
++            type,diffuse:{r:type/4,g:0,b:0,a:1},specular:{r:0,g:0.5,b:0,a:1},ambient:{r:0,g:0,b:0.25,a:1},
++            position:{x:1,y:2,z:3},direction:{x:0,y:0,z:2},range:64,falloff:2,
++            attenuation0:1,attenuation1:0.5,attenuation2:0.25,theta:0,phi:Math.PI,
++        });
++        t.state.viewMatrix=new Float32Array(I);t.state.viewMatrix[12]=10;
++        t.state.lights=[light(3),light(1),light(2)];t.write();
++        expect(t.at(7)[0]).toBe(3);
++        for(let i=0;i<3;i++){
++            const b=8+i*7;
++            expect(t.at(b+3)).toEqual([11,2,3,64]);
++            expect(t.at(b+5)).toEqual([1,0.5,0.25,[3,1,2][i]]);
++            expect(t.at(b+4)[2]).toBe(i===0?-1:1);
++            expect(t.at(b+4)[3]).toBe(2);
++            expect(t.at(b+6)[0]).toBe(1);
++            expect(t.at(b+6)[1]).toBeCloseTo(0,6);
++        }
++        // A later light disable must clear stale light records, not replay them.
++        t.state.lights=[];t.write();
++        expect(t.at(7)[0]).toBe(0);
++        expect(t.at(8)).toEqual([0,0,0,0]);
++    });
++});

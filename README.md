@@ -60,9 +60,10 @@ The scoped `isolation-sw.js` adds the COOP/COEP response policies required for S
 2. Resolve versioned CRT files under their actual requested name when an app-directory rule overrides an HLE alias.
 3. Upload CPU-written D3D8 backbuffers before presentation, including native video frames that are not followed by a primitive draw. Authority checks preserve GPU-rendered frames.
 4. Preserve both regions of wrapped DirectSound writes. Dropping the region at the start of the buffer replayed stale audio every buffer lap (about 2.7 times per second with the game's 32 KiB, 22.05 kHz stereo buffer).
-5. Use the deployment base for static runtime assets and navigation, and omit unrelated game covers/reference images from publication.
+5. Preserve programmable pixel shaders when a declaration-only D3D8 vertex stage enables lighting. The synthesized stage uses the shared FFP lighting equation, material sources, normal transform, and directional/point/spot light data; unsupported vertex combinations emit a diagnostic.
+6. Use the deployment base for static runtime assets and navigation, and omit unrelated game covers/reference images from publication.
 
-The loader, backbuffer, and audio corrections are generic runtime fixes, covered by regression tests. The browser uses the original game-shipped DLLs from the user's ISO; no new substitute implementations or game patches are distributed.
+The loader, backbuffer, audio, and shader corrections are generic runtime fixes, covered by regression tests. The browser uses the original game-shipped DLLs from the user's ISO; no new substitute implementations or game patches are distributed.
 
 ## Licenses
 
